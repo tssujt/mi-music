@@ -153,4 +153,3 @@ MIT License
 
 - [miservice](https://github.com/Yonsm/MiService)
 - [fastapi](https://github.com/fastapi/fastapi)
-- [jwt](https://github.com/jpadilla/pyjwt)
