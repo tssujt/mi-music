@@ -4,15 +4,9 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from auth import JWTAuth, authenticate_system_user
 from mi_session import MinaProvider
 from schemas import (
     ApiResponse,
-    SystemLoginRequest,
-    LoginResponse,
-    RefreshTokenRequest,
-    TokenRefreshResponse,
-    XiaomiLoginRequest,
     DeviceInfo,
     PlayUrlRequest,
     VolumeRequest,
@@ -25,84 +19,15 @@ from utils import build_music_payload, sanitize_tts_text, parse_tts_cmd, find_de
 LOGGER = logging.getLogger("xiaomi_api.routes")
 
 
-def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[], MinaProvider]) -> APIRouter:
-    """组合系统认证与小米控制的统一路由。"""
+def get_router(get_provider: Callable[[], MinaProvider]) -> APIRouter:
+    """提供小米设备控制的路由。"""
 
     router = APIRouter()
-
-    # ============ 系统认证 ============
-
-    @router.post("/auth/login", response_model=LoginResponse)
-    async def auth_login(request: SystemLoginRequest):
-        """系统登录，返回 access/refresh。"""
-        if not authenticate_system_user(request.username, request.password, system_users):
-            raise HTTPException(status_code=401, detail="用户名或密码错误")
-        token_data = {"sub": request.username}
-        return LoginResponse(
-            success=True,
-            message="系统登录成功",
-            access_token=jwt_auth.create_access_token(token_data),
-            refresh_token=jwt_auth.create_refresh_token(token_data),
-            token_type="bearer",
-        )
-
-    @router.post("/auth/refresh", response_model=TokenRefreshResponse)
-    async def auth_refresh(request: RefreshTokenRequest):
-        """刷新访问令牌。"""
-        payload = jwt_auth.verify_token(request.refresh_token, "refresh")
-        token_data = {"sub": payload.get("sub")}
-        return TokenRefreshResponse(
-            success=True,
-            message="Token 刷新成功",
-            access_token=jwt_auth.create_access_token(token_data),
-            refresh_token=jwt_auth.create_refresh_token(token_data),
-            token_type="bearer",
-        )
-
-    @router.get("/auth/status")
-    async def auth_status(current_user=Depends(jwt_auth.get_current_user)):
-        """查询系统登录状态。"""
-        return {
-            "detail": "系统已登录",
-            "user": current_user.get("sub"),
-            "should_refresh": current_user.get("_should_refresh", False),
-        }
-
-    # ============ 小米会话/设备/控制（需系统 JWT） ============
 
     def provider_dep() -> MinaProvider:
         return get_provider()
 
-    @router.post("/mi/account/login", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
-    async def mi_login(request: XiaomiLoginRequest, provider: MinaProvider = Depends(provider_dep)):
-        """小米账号登录，初始化/更新小米会话。"""
-        if not request.username or not request.password:
-            raise HTTPException(status_code=400, detail="请提供小米账号与密码")
-        try:
-            await provider.login(request.username, request.password)
-        except Exception as e:
-            LOGGER.error(f"小米登录失败: {e}")
-            return ApiResponse(success=False, message="小米登录失败", data={"error": str(e)})
-        devices = await provider.device_list()
-        return ApiResponse(success=True, message="小米登录成功", data={"devices_count": len(devices)})
-
-    @router.post("/mi/account/logout", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
-    async def mi_logout(provider: MinaProvider = Depends(provider_dep)):
-        """小米账号登出，清理会话与会话文件。"""
-        await provider.logout()
-        return ApiResponse(success=True, message="小米账号已登出")
-
-    @router.get("/mi/account/status", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
-    async def mi_status(provider: MinaProvider = Depends(provider_dep)):
-        """查询小米登录状态。"""
-        try:
-            await provider.ensure_mina()
-            count = len(await provider.device_list())
-            return ApiResponse(success=True, message="小米账号已登录，已获取到设备数量：" + str(count), data={"logged_in": True, "devices_count": count})
-        except HTTPException:
-            return ApiResponse(success=False, message="小米账号未登录，请先登录小米账号", data={"logged_in": False})
-
-    @router.get("/devices", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.get("/devices", response_model=ApiResponse)
     async def get_devices(provider: MinaProvider = Depends(provider_dep)):
         """获取设备列表。"""
         devices = await provider.device_list()
@@ -119,7 +44,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         ]
         return ApiResponse(success=True, message=f"获取到 {len(device_list)} 台设备", data=device_list)
 
-    @router.post("/mi/device/playback/play-url", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.post("/mi/device/playback/play-url", response_model=ApiResponse)
     async def play_url(request: PlayUrlRequest, provider: MinaProvider = Depends(provider_dep)):
         """播放指定 URL。"""
         mina = await provider.ensure_mina()
@@ -133,7 +58,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         )
         return ApiResponse(success=True, message="播放命令已发送", data={"result": result, "device_id": device_id})
 
-    @router.post("/mi/device/playback/pause", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.post("/mi/device/playback/pause", response_model=ApiResponse)
     async def pause_playback(request: PlayControlRequest, provider: MinaProvider = Depends(provider_dep)):
         """暂停播放。"""
         mina = await provider.ensure_mina()
@@ -141,7 +66,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         result = await mina.ubus_request(device_id, "player_play_operation", "mediaplayer", {"action": "pause", "media": "app_ios"})
         return ApiResponse(success=True, message="暂停命令已发送", data={"result": result, "device_id": device_id})
 
-    @router.post("/mi/device/playback/play", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.post("/mi/device/playback/play", response_model=ApiResponse)
     async def playback_play(request: PlayControlRequest, provider: MinaProvider = Depends(provider_dep)):
         """恢复播放。"""
         mina = await provider.ensure_mina()
@@ -149,7 +74,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         result = await mina.ubus_request(device_id, "player_play_operation", "mediaplayer", {"action": "play", "media": "app_ios"})
         return ApiResponse(success=True, message="恢复播放命令已发送", data={"result": result, "device_id": device_id})
 
-    @router.post("/mi/device/playback/stop", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.post("/mi/device/playback/stop", response_model=ApiResponse)
     async def playback_stop(request: PlayControlRequest, provider: MinaProvider = Depends(provider_dep)):
         """停止播放。"""
         mina = await provider.ensure_mina()
@@ -157,7 +82,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         result = await mina.ubus_request(device_id, "player_play_operation", "mediaplayer", {"action": "stop", "media": "app_ios"})
         return ApiResponse(success=True, message="停止命令已发送", data={"result": result, "device_id": device_id})
 
-    @router.get("/mi/device/playback/status", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.get("/mi/device/playback/status", response_model=ApiResponse)
     async def playback_status(device_selector: str, provider: MinaProvider = Depends(provider_dep)):
         """查询播放状态。支持 device_selector（deviceID/miotDID/alias/name）。"""
         mina = await provider.ensure_mina()
@@ -179,7 +104,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
             pass
         return ApiResponse(success=bool(resp and resp.get("code") == 0), message="获取播放状态", data={"status": resp, "device_id": device_id})
 
-    @router.post("/mi/device/tts", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.post("/mi/device/tts", response_model=ApiResponse)
     async def tts_speak(request: TTSRequest, provider: MinaProvider = Depends(provider_dep)):
         """文字转语音，优先 MiIO，回退 MiNA。"""
         from const import TTS_COMMAND
@@ -202,7 +127,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         result = await mina.text_to_speech(device_id, request.text)
         return ApiResponse(success=True, message="文字转语音命令已发送(mina)", data={"result": result, "device_id": device_id})
 
-    @router.post("/mi/device/volume", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.post("/mi/device/volume", response_model=ApiResponse)
     async def set_volume(request: VolumeRequest, provider: MinaProvider = Depends(provider_dep)):
         """设置音量。"""
         mina = await provider.ensure_mina()
@@ -210,7 +135,7 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         result = await mina.player_set_volume(device_id, request.volume)
         return ApiResponse(success=True, message=f"音量已设置为 {request.volume}", data={"result": result, "device_id": device_id})
 
-    @router.get("/mi/device/volume", response_model=ApiResponse, dependencies=[Depends(jwt_auth.get_current_user)])
+    @router.get("/mi/device/volume", response_model=ApiResponse)
     async def get_volume(device_selector: str, provider: MinaProvider = Depends(provider_dep)):
         """获取设备当前音量。"""
         mina = await provider.ensure_mina()
@@ -237,5 +162,3 @@ def get_router(jwt_auth: JWTAuth, system_users: dict, get_provider: Callable[[],
         raise HTTPException(status_code=500, detail="获取音量失败")
 
     return router
-
-

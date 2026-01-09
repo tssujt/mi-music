@@ -1,9 +1,5 @@
 *.pyc
 __pycache__
 .mi_account_session.json
-config.yml
-*.local.yml
 .env
 *.env.*
-conf/config.yml
-conf/.mi_account_session.json

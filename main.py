@@ -1,50 +1,24 @@
-import asyncio
 import os
 import logging
-from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
-from pathlib import Path
-import json
 
-import jwt
-import yaml
-from fastapi import FastAPI, HTTPException, Depends, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 from aiohttp import ClientSession
 from cachetools import TTLCache
-from auth import JWTAuth
 from mi_session import MinaProvider
 from routes import get_router
 
-from miservice import MiAccount, MiNAService, MiIOService, miio_command, miio_command_help
+from miservice import MiAccount, MiNAService, MiIOService
 
 from const import TTS_COMMAND
 
 
-# 配置加载函数
-def load_config(config_path: str = "conf/config.yml") -> Dict[str, Any]:
-    """加载YAML配置文件"""
-    config_file = Path(config_path)
-    if not config_file.exists():
-        raise FileNotFoundError(f"配置文件不存在: {config_path}")
-    
-    with open(config_file, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    
-    return config
-
-
-# 加载配置
-config = load_config()
-
-# 日志配置
-log_config = config.get('logging', {})
-LOG_LEVEL = log_config.get('level', 'INFO')
-LOG_FORMAT = log_config.get('format', '%(asctime)s | %(levelname)s | %(message)s')
-LOG_DATE_FORMAT = log_config.get('date_format', '%H:%M:%S')
+# 日志配置（从环境变量读取）
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+LOG_FORMAT = os.getenv('LOG_FORMAT', '%(asctime)s | %(levelname)s | %(message)s')
+LOG_DATE_FORMAT = os.getenv('LOG_DATE_FORMAT', '%H:%M:%S')
 
 # 配置日志
 LOGGER = logging.getLogger("xiaomi_api")
@@ -54,38 +28,20 @@ logging.basicConfig(
     datefmt=LOG_DATE_FORMAT
 )
 
-# 小米会话文件路径（硬编码）
-MI_TOKEN_PATH = 'conf/.mi_account_session.json'
+# 小米会话文件路径（从环境变量读取，默认使用临时目录）
+MI_TOKEN_PATH = os.getenv('MI_SESSION_PATH', '/tmp/.mi_account_session.json')
 
-# 系统登录配置（用于我们自己的系统登录）
-system_auth_config = config.get('system_auth', {})
-SYSTEM_USERS: Dict[str, str] = {
-    user.get('username'): user.get('password')
-    for user in system_auth_config.get('users', [])
-    if isinstance(user, dict) and user.get('username') is not None
-}
-if not SYSTEM_USERS:
-    LOGGER.warning("未在 conf/config.yml 中配置 system_auth.users，系统登录将无法通过校验")
+# 从环境变量读取小米账号凭据
+XIAOMI_USERNAME = os.getenv('XIAOMI_USERNAME', '')
+XIAOMI_PASSWORD = os.getenv('XIAOMI_PASSWORD', '')
 
-# JWT 配置
-jwt_config = config.get('jwt', {})
-JWT_SECRET_KEY = jwt_config.get('secret_key')
-if not JWT_SECRET_KEY:
-    LOGGER.error("JWT secret_key 未配置！请在 conf/config.yml 中设置有效的密钥")
-    raise ValueError("JWT secret_key 必须在 conf/config.yml 中配置")
+if not XIAOMI_USERNAME or not XIAOMI_PASSWORD:
+    LOGGER.warning("环境变量 XIAOMI_USERNAME 或 XIAOMI_PASSWORD 未设置，将依赖会话文件恢复登录")
 
-JWT_ALGORITHM = jwt_config.get('algorithm', 'HS256')
-JWT_EXPIRE_MINUTES = jwt_config.get('access_token_expire_minutes', 60)
-JWT_REFRESH_EXPIRE_DAYS = jwt_config.get('refresh_token_expire_days', 7)
-JWT_AUTO_REFRESH_THRESHOLD = jwt_config.get('auto_refresh_threshold_minutes', 10)
-
-LOGGER.info(f"JWT 配置已加载 | 算法: {JWT_ALGORITHM} | 访问令牌过期: {JWT_EXPIRE_MINUTES}分钟 | 刷新令牌过期: {JWT_REFRESH_EXPIRE_DAYS}天")
-
-# API 服务配置
-api_config = config.get('api', {})
-HOST = api_config.get('host', '0.0.0.0')
-PORT = api_config.get('port', 8000)
-DEBUG = api_config.get('debug', False)
+# API 服务配置（从环境变量读取）
+HOST = os.getenv('API_HOST', '0.0.0.0')
+PORT = int(os.getenv('API_PORT', '8000'))
+DEBUG = os.getenv('API_DEBUG', 'false').lower() in ('true', '1', 'yes')
 
 # 全局变量
 http_session: Optional[ClientSession] = None
@@ -97,137 +53,53 @@ devices_ttl_cache: TTLCache = TTLCache(maxsize=1, ttl=30)
 mina_provider: MinaProvider | None = None
 
 
-# Pydantic 模型
-class SystemLoginRequest(BaseModel):
-    username: str = Field(..., description="系统用户名")
-    password: str = Field(..., description="系统密码")
-
-
-class LoginResponse(BaseModel):
-    success: bool
-    message: str
-    masked_account: Optional[str] = None
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    token_type: Optional[str] = None
-    expires_in: Optional[int] = None
-    refresh_expires_in: Optional[int] = None
-
-
-class RefreshTokenRequest(BaseModel):
-    refresh_token: str = Field(..., description="刷新令牌")
-
-
-class TokenRefreshResponse(BaseModel):
-    success: bool
-    message: str
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    token_type: Optional[str] = None
-    expires_in: Optional[int] = None
-    refresh_expires_in: Optional[int] = None
-
-
-class XiaomiLoginRequest(BaseModel):
-    username: Optional[str] = Field(None, description="小米账号")
-    password: Optional[str] = Field(None, description="小米密码")
-
-
-class DeviceInfo(BaseModel):
-    deviceID: str
-    name: Optional[str] = None
-    alias: Optional[str] = None
-    miotDID: Optional[str] = None
-    hardware: Optional[str] = None
-    capabilities: Optional[Dict[str, Any]] = None
-
-
-class PlayUrlRequest(BaseModel):
-    device_selector: str = Field(
-        ..., 
-        description="设备选择器",
-        example="笨蛋小然",
-        title="设备选择器",
-        json_schema_extra={
-            "description": "可以是设备ID、miotDID、别名或名称。建议先调用 /devices 获取设备列表，然后复制对应的 deviceID、alias 或 name"
-        }
-    )
-    url: str = Field(..., description="播放URL", example="https://lhttp.qtfm.cn/live/4915/64k.mp3")
-    type: int = Field(default=2, description="播放类型", example=2, title="播放类型 (1=音乐, 2=其他)")
-
-
-class VolumeRequest(BaseModel):
-    device_selector: str = Field(
-        ..., 
-        description="设备选择器",
-        example="笨蛋小然",
-        title="设备选择器",
-        json_schema_extra={
-            "description": "可以是设备ID、miotDID、别名或名称"
-        }
-    )
-    volume: int = Field(..., ge=0, le=100, description="音量 (0-100)", example=50)
-
-
-class TTSRequest(BaseModel):
-    device_selector: str = Field(
-        ..., 
-        description="设备选择器",
-        example="笨蛋小然",
-        title="设备选择器"
-    )
-    text: str = Field(..., description="要转换的文字", example="你好，小米音响")
-
-
-class PlayControlRequest(BaseModel):
-    device_selector: str = Field(
-        ..., 
-        description="设备选择器",
-        example="笨蛋小然",
-        title="设备选择器"
-    )
-
-
-class ApiResponse(BaseModel):
-    success: bool
-    message: str
-    data: Optional[Any] = None
-
-
 # 生命周期管理
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_session, mi_account, mina_service
     LOGGER.info("启动 FastAPI 应用...")
-    
+
     # 创建 HTTP 会话
     http_session = ClientSession()
     LOGGER.info("HTTP 会话已创建")
-    
-    # 确保配置目录存在
-    token_dir = os.path.dirname(MI_TOKEN_PATH) or "."
-    os.makedirs(token_dir, exist_ok=True)
-    
-    # 用 Provider 恢复会话
+
+    # 确保会话文件目录存在
+    token_dir = os.path.dirname(MI_TOKEN_PATH)
+    if token_dir:
+        os.makedirs(token_dir, exist_ok=True)
+
+    # 初始化小米 Provider 并尝试登录
     try:
         global mina_provider
         from mi_session import MinaProvider
         mina_provider = MinaProvider(MI_TOKEN_PATH, http_session)
+
+        # 先尝试从会话文件恢复
         restored = await mina_provider.try_restore_from_file()
+
+        if restored:
+            LOGGER.info("已基于会话文件恢复小米会话")
+        elif XIAOMI_USERNAME and XIAOMI_PASSWORD:
+            # 如果会话恢复失败且环境变量已设置，则自动登录
+            LOGGER.info("会话文件恢复失败，使用环境变量登录小米账号...")
+            try:
+                await mina_provider.login(XIAOMI_USERNAME, XIAOMI_PASSWORD)
+                LOGGER.info("小米账号自动登录成功")
+            except Exception as login_exc:
+                LOGGER.error(f"小米账号自动登录失败: {login_exc}")
+        else:
+            LOGGER.warning("未能恢复会话且环境变量未设置，小米功能将不可用")
+
         # 启动会话文件监听
         try:
             await mina_provider.start_session_file_watcher()
         except Exception as _exc:
             LOGGER.warning(f"会话文件监听启动失败：{_exc}")
-        if restored:
-            LOGGER.info("已基于会话文件恢复小米会话")
-        else:
-            LOGGER.info("未能基于会话文件恢复，需要登录后方可使用")
     except Exception as exc:
-        LOGGER.warning(f"启动时会话文件恢复失败：{exc}")
-    
+        LOGGER.warning(f"小米 Provider 初始化失败：{exc}")
+
     yield
-    
+
     # 清理资源
     if http_session:
         await http_session.close()
@@ -240,80 +112,10 @@ async def lifespan(app: FastAPI):
         pass
 
 
-# JWT 工具函数
-def create_access_token(data: dict) -> str:
-    """创建访问令牌"""
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
-    to_encode.update({
-        "exp": expire,
-        "type": "access"
-    })
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-    return encoded_jwt
-
-
-def create_refresh_token(data: dict) -> str:
-    """创建刷新令牌"""
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=JWT_REFRESH_EXPIRE_DAYS)
-    to_encode.update({
-        "exp": expire,
-        "type": "refresh"
-    })
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-    return encoded_jwt
-
-
-def verify_token(token: str, token_type: str = "access") -> dict:
-    """验证 JWT token"""
-    try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        
-        # 检查 token 类型
-        if payload.get("type") != token_type:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Token 类型错误，期望 {token_type}",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token 已过期，请使用刷新令牌获取新的访问令牌")
-    except jwt.InvalidSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token 签名无效")
-    except jwt.DecodeError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token 解析失败")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token 无效")
-
-
-def check_token_expiry(payload: dict) -> bool:
-    """检查 Token 是否即将过期（需要刷新）"""
-    exp = payload.get("exp")
-    if not exp:
-        return True
-    
-    exp_time = datetime.fromtimestamp(exp)
-    current_time = datetime.utcnow()
-    time_left = exp_time - current_time
-    
-    # 如果剩余时间少于阈值，需要刷新
-    return time_left.total_seconds() < (JWT_AUTO_REFRESH_THRESHOLD * 60)
-
-
-def authenticate_system_user(username: str, password: str) -> bool:
-    """校验系统用户名与密码是否匹配配置"""
-    expected_password = SYSTEM_USERS.get(username)
-    return expected_password is not None and expected_password == password
-
-
-# 应用信息配置
-app_config = config.get('app', {})
-APP_NAME = app_config.get('name', '小米音响控制 API')
-APP_VERSION = app_config.get('version', '1.0.0')
-APP_DESCRIPTION = app_config.get('description', '基于 FastAPI 和 MiService 的小米音响控制接口')
+# 应用信息配置（从环境变量读取）
+APP_NAME = os.getenv('APP_NAME', '小米音响控制 API')
+APP_VERSION = os.getenv('APP_VERSION', '1.0.0')
+APP_DESCRIPTION = os.getenv('APP_DESCRIPTION', '基于 FastAPI 和 MiService 的小米音响控制接口')
 
 # 创建 FastAPI 应用
 app = FastAPI(title=APP_NAME, description=APP_DESCRIPTION, version=APP_VERSION, lifespan=lifespan)
@@ -336,8 +138,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     LOGGER.exception(f"Unhandled exception: {exc}")
     return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
 
-security = HTTPBearer()
-
 
 # 依赖注入
 async def get_http_session() -> ClientSession:
@@ -346,30 +146,15 @@ async def get_http_session() -> ClientSession:
     return http_session
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """获取当前用户（验证 JWT token，支持自动刷新提醒）"""
-    token = credentials.credentials
-    payload = verify_token(token, "access")
-    
-    # 检查是否需要刷新
-    if check_token_expiry(payload):
-        LOGGER.info(f"Token 即将过期，建议刷新 | user={payload.get('sub')}")
-        # 在响应头中添加刷新提醒（可选）
-        payload["_should_refresh"] = True
-    
-    return payload
-
-
-async def get_mina_service(current_user: dict = Depends(get_current_user)) -> MiNAService:
-    """获取 MiNAService（需要认证）"""
+async def get_mina_service() -> MiNAService:
+    """获取 MiNAService"""
     if not mina_service:
         # 懒加载：若存在会话文件，尝试用其恢复一次
         try:
-            restored = await try_restore_session_from_file_only()
+            await try_restore_session_from_file_only()
         except Exception as exc:
             LOGGER.warning(f"懒加载恢复失败：{exc}")
-            restored = False
-        if not restored:
+        if not mina_service:
             raise HTTPException(status_code=401, detail="请先登录小米账号")
     return mina_service
 
@@ -453,10 +238,8 @@ async def try_restore_session_from_file_only() -> bool:
         resp = await account.mi_request('micoapi', url, None, headers, relogin=False)
 
         if resp and resp.get('code') == 0:
-            devices = resp.get('data') or []
             mi_account = account
             mina_service = MiNAService(account)
-            # 不缓存设备列表
             return True
 
         LOGGER.warning("会话文件验证失败（code!=0），需重新登录")
@@ -474,22 +257,22 @@ def find_device_by_selector(devices: List[Dict[str, Any]], selector: str) -> Opt
     """根据选择器查找设备ID"""
     if not selector:
         return devices[0].get("deviceID") if devices else None
-    
+
     # 1) 已是 deviceID（形如 UUID，有横杠）
     if "-" in selector and any(d.get("deviceID") == selector for d in devices):
         return selector
-    
+
     # 2) 是 miotDID（纯数字）
     if selector.isdigit():
         for d in devices:
             if str(d.get("miotDID")) == selector:
                 return d.get("deviceID")
-    
+
     # 3) 按别名/名称匹配
     for d in devices:
         if d.get("alias") == selector or d.get("name") == selector:
             return d.get("deviceID")
-    
+
     # 兜底：第一台
     return devices[0].get("deviceID") if devices else None
 
@@ -503,10 +286,10 @@ async def resolve_device_id(selector: str, mina: MiNAService) -> str:
     device_id = find_device_by_selector(devices, selector)
     if not device_id:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"未找到匹配的设备: {selector}。请先调用 /devices 查看可用设备"
         )
-    
+
     return device_id
 
 
@@ -520,30 +303,13 @@ async def health_check():
     return {"detail": "服务健康"}
 
 
-from routes import get_router
-from auth import JWTAuth
-
-system_users = {u.get('username'): u.get('password') for u in config.get('system_auth', {}).get('users', []) if isinstance(u, dict)}
-jwt_auth_for_routes = JWTAuth(
-    secret_key=JWT_SECRET_KEY,
-    algorithm=JWT_ALGORITHM,
-    access_minutes=JWT_EXPIRE_MINUTES,
-    refresh_days=JWT_REFRESH_EXPIRE_DAYS,
-    auto_refresh_threshold_minutes=JWT_AUTO_REFRESH_THRESHOLD,
-)
-# 合并后的路由由 get_router 提供，无需单独注册 auth 路由
-
-
-# /auth/status 与 /auth/refresh 已在 routes_auth 中定义
-
-
 def _get_provider():
     global mina_provider
     if mina_provider is None:
         raise HTTPException(status_code=500, detail="小米 Provider 未初始化")
     return mina_provider
 
-app.include_router(get_router(jwt_auth_for_routes, system_users, _get_provider))
+app.include_router(get_router(_get_provider))
 
 
 """/mi/* 路由已移至 routes_mi.py"""
@@ -567,24 +333,24 @@ app.include_router(get_router(jwt_auth_for_routes, system_users, _get_provider))
 #     """停止播放"""
 #     try:
 #         device_id = await resolve_device_id(request.device_selector, mina)
-        
+
 #         LOGGER.info(f"停止播放 | selector={request.device_selector} | device_id={device_id}")
-        
+
 #         result = await mina.ubus_request(
 #             device_id,
 #             "player_play_operation",
 #             "mediaplayer",
 #             {"action": "stop", "media": "app_ios"},
 #         )
-        
+
 #         LOGGER.info(f"停止命令完成 | result={result}")
-        
+
 #         return ApiResponse(
 #             success=True,
 #             message="停止命令已发送",
 #             data={"result": result, "device_id": device_id}
 #         )
-        
+
 #     except Exception as e:
 #         LOGGER.error(f"停止失败: {e}")
 #         if isinstance(e, HTTPException):
@@ -640,7 +406,7 @@ async def perform_tts(device_id: str, text: str, mina: MiNAService) -> Any:
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "main:app",
         host=HOST,
