@@ -27,6 +27,7 @@
 
 ```bash
 pip install -r requirements.txt
+pip install --no-deps --no-build-isolation miservice==2.3.0
 ```
 
 ### 2. 配置环境变量

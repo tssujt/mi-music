@@ -1,8 +1,10 @@
 aiohttp==3.12.15
 aiofiles==24.1.0
-miservice==2.3.0
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 pydantic==2.11.7
 python-multipart==0.0.20
 cachetools==6.1.0
+
+# miservice 的安装请使用如下命令（不要直接在 requirements.txt 里安装）：
+# pip install --no-deps --no-build-isolation miservice==2.3.0

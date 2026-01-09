@@ -10,9 +10,9 @@ WORKDIR /app
 COPY requirements.txt ./
 
 # 安装 Python 依赖
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir aiohttp==3.12.15 aiofiles==24.1.0 \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install -r requirements.txt \
+    && pip install --no-deps --no-build-isolation miservice==2.3.0
 
 # 复制应用代码
 COPY . .
